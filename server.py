@@ -345,18 +345,16 @@ async def oauth_callback(request: Request):
     if "refresh_token" not in tokens:
         return HTMLResponse(f"<h1>❌ Erro na troca de token</h1><pre>{json.dumps(tokens, indent=2)}</pre>")
 
+    rt = tokens["refresh_token"]
     _token_cache["access_token"]  = tokens["access_token"]
-    _token_cache["refresh_token"] = tokens["refresh_token"]
+    _token_cache["refresh_token"] = rt
     _token_cache["expires_at"]    = datetime.now().timestamp() + tokens.get("expires_in", 3600) - 120
 
-    rt = tokens["refresh_token"]
-    return HTMLResponse(f"""
+    await _save_refresh_token_to_render(rt)
+
+    return HTMLResponse("""
     <h1>✅ Autorizado com sucesso!</h1>
-    <p>Agora adicione esta variável de ambiente no Railway para que o token sobreviva a reinicializações:</p>
-    <p><strong>Nome:</strong> <code>CONTA_AZUL_REFRESH_TOKEN</code></p>
-    <p><strong>Valor:</strong></p>
-    <textarea rows="3" cols="80" onclick="this.select()">{rt}</textarea>
-    <p>Depois de adicionar, pode fechar essa janela. O MCP está pronto.</p>
+    <p>Token salvo automaticamente. Pode fechar essa janela — o MCP está pronto.</p>
     """)
 
 async def health(request: Request):
