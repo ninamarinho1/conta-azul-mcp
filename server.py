@@ -35,15 +35,25 @@ RENDER_API_KEY  = os.environ.get("RENDER_API_KEY", "")
 RENDER_SERVICE_ID = "srv-d6tcskfafjfc73ffao2g"
 
 async def _save_refresh_token_to_render(token: str):
-    """Salva o refresh_token como variável de ambiente no Render automaticamente."""
+    """Atualiza apenas o CONTA_AZUL_REFRESH_TOKEN no Render, preservando todas as outras variáveis."""
     if not RENDER_API_KEY:
         return
     try:
         async with httpx.AsyncClient(timeout=10) as client:
+            # 1. Busca as variáveis existentes
+            resp = await client.get(
+                f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/env-vars",
+                headers={"Authorization": f"Bearer {RENDER_API_KEY}"},
+            )
+            existing = resp.json() if resp.status_code == 200 else []
+            # 2. Atualiza só o refresh_token, mantém o resto
+            env_vars = [v for v in existing if v.get("key") != "CONTA_AZUL_REFRESH_TOKEN"]
+            env_vars.append({"key": "CONTA_AZUL_REFRESH_TOKEN", "value": token})
+            # 3. Salva tudo de volta
             await client.put(
                 f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/env-vars",
                 headers={"Authorization": f"Bearer {RENDER_API_KEY}", "Content-Type": "application/json"},
-                json=[{"key": "CONTA_AZUL_REFRESH_TOKEN", "value": token}],
+                json=env_vars,
             )
     except Exception:
         pass  # falha silenciosa — não quebra o fluxo principal
