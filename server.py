@@ -31,6 +31,23 @@ def _load_initial_tokens():
 
 _load_initial_tokens()
 
+RENDER_API_KEY  = os.environ.get("RENDER_API_KEY", "")
+RENDER_SERVICE_ID = "srv-d6tcskfafjfc73ffao2g"
+
+async def _save_refresh_token_to_render(token: str):
+    """Salva o refresh_token como variável de ambiente no Render automaticamente."""
+    if not RENDER_API_KEY:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.put(
+                f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/env-vars",
+                headers={"Authorization": f"Bearer {RENDER_API_KEY}", "Content-Type": "application/json"},
+                json=[{"key": "CONTA_AZUL_REFRESH_TOKEN", "value": token}],
+            )
+    except Exception:
+        pass  # falha silenciosa — não quebra o fluxo principal
+
 async def _get_access_token() -> str:
     if not _token_cache.get("refresh_token"):
         raise RuntimeError("Não autorizado. Acesse /auth no navegador para autorizar.")
@@ -52,9 +69,14 @@ async def _get_access_token() -> str:
         resp.raise_for_status()
         tokens = resp.json()
 
+    new_rt = tokens.get("refresh_token", _token_cache["refresh_token"])
     _token_cache["access_token"]  = tokens["access_token"]
-    _token_cache["refresh_token"] = tokens.get("refresh_token", _token_cache["refresh_token"])
+    _token_cache["refresh_token"] = new_rt
     _token_cache["expires_at"]    = datetime.now().timestamp() + tokens.get("expires_in", 3600) - 120
+
+    # Salva o novo refresh_token no Render automaticamente
+    await _save_refresh_token_to_render(new_rt)
+
     return _token_cache["access_token"]
 
 async def _get(path: str, params: dict = None) -> dict:
