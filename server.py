@@ -127,6 +127,23 @@ async def list_tools() -> list[Tool]:
             description="Lista os centros de custo cadastrados.",
             inputSchema={"type": "object", "properties": {}},
         ),
+        Tool(
+            name="extrato_mensal",
+            description=(
+                "Retorna o extrato completo do mês — receitas e despesas — "
+                "com fornecedor/cliente, valor, categoria, centro de custo e status. "
+                "Equivalente ao XLS exportado do Conta Azul. "
+                "Se não informar mês/ano, usa o mês atual."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "mes":  {"type": "integer", "description": "Mês (1-12). Padrão: mês atual."},
+                    "ano":  {"type": "integer", "description": "Ano (ex: 2026). Padrão: ano atual."},
+                    "status": {"type": "string", "description": "Opcional: PENDENTE, QUITADO, ATRASADO, CANCELADO"},
+                },
+            },
+        ),
     ]
 
 @server.call_tool()
@@ -207,6 +224,68 @@ async def _dispatch(name: str, args: dict) -> dict:
 
     elif name == "listar_centros_de_custo":
         return await _get("/centro-de-custo", {"pagina": 1, "tamanho_pagina": 100, "filtro_rapido": "ATIVO"})
+
+    elif name == "extrato_mensal":
+        hoje = datetime.now()
+        mes = args.get("mes") or hoje.month
+        ano = args.get("ano") or hoje.year
+        import calendar
+        ultimo_dia = calendar.monthrange(ano, mes)[1]
+        data_inicio = f"{ano}-{mes:02d}-01"
+        data_fim    = f"{ano}-{mes:02d}-{ultimo_dia}"
+
+        params_base = {
+            "pagina": 1,
+            "tamanho_pagina": 500,
+            "data_vencimento_de": data_inicio,
+            "data_vencimento_ate": data_fim,
+        }
+        if args.get("status"):
+            params_base["status"] = args["status"]
+
+        def _parse_items(data):
+            return data.get("items") or data.get("content") or (data if isinstance(data, list) else [])
+
+        def _normalizar(items, tipo):
+            result = []
+            for item in items:
+                parcelas = item.get("parcelas") or [item]
+                for p in parcelas:
+                    result.append({
+                        "tipo":          tipo,
+                        "fornecedor_cliente": (item.get("pessoa") or {}).get("nome"),
+                        "descricao":     p.get("descricao") or item.get("descricao"),
+                        "categoria":     (p.get("categoria") or {}).get("nome"),
+                        "centro_custo":  (p.get("centro_de_custo") or {}).get("nome"),
+                        "valor":         p.get("valor"),
+                        "valor_pago":    p.get("valor_pago"),
+                        "status":        p.get("status"),
+                        "vencimento":    p.get("data_vencimento"),
+                        "pagamento":     p.get("data_pagamento"),
+                    })
+            return result
+
+        despesas_raw = await _get("/financeiro/eventos-financeiros/contas-a-pagar/buscar", params_base)
+        receitas_raw = await _get("/financeiro/eventos-financeiros/contas-a-receber/buscar", params_base)
+
+        despesas = _normalizar(_parse_items(despesas_raw), "DESPESA")
+        receitas = _normalizar(_parse_items(receitas_raw), "RECEITA")
+
+        total_despesas = sum(i["valor"] or 0 for i in despesas)
+        total_receitas = sum(i["valor"] or 0 for i in receitas)
+
+        return {
+            "periodo": f"{mes:02d}/{ano}",
+            "resumo": {
+                "total_receitas": total_receitas,
+                "total_despesas": total_despesas,
+                "saldo": total_receitas - total_despesas,
+                "qtd_receitas": len(receitas),
+                "qtd_despesas": len(despesas),
+            },
+            "despesas": despesas,
+            "receitas": receitas,
+        }
 
     else:
         raise ValueError(f"Tool desconhecida: {name}")
