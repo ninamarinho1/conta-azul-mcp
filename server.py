@@ -160,8 +160,8 @@ async def _dispatch(name: str, args: dict) -> dict:
         params = {
             "pagina": 1,
             "tamanho_pagina": 200,
-            "data_vencimento_de": args["data_inicio"],
-            "data_vencimento_ate": args["data_fim"],
+            "data_pagamento_de": args["data_inicio"],
+            "data_pagamento_ate": args["data_fim"],
         }
         if args.get("status"):
             params["status"] = args["status"]
@@ -171,8 +171,8 @@ async def _dispatch(name: str, args: dict) -> dict:
         params = {
             "pagina": 1,
             "tamanho_pagina": 200,
-            "data_vencimento_de": args["data_inicio"],
-            "data_vencimento_ate": args["data_fim"],
+            "data_pagamento_de": args["data_inicio"],
+            "data_pagamento_ate": args["data_fim"],
         }
         if args.get("status"):
             params["status"] = args["status"]
@@ -237,8 +237,8 @@ async def _dispatch(name: str, args: dict) -> dict:
         params_base = {
             "pagina": 1,
             "tamanho_pagina": 500,
-            "data_vencimento_de": data_inicio,
-            "data_vencimento_ate": data_fim,
+            "data_pagamento_de": data_inicio,
+            "data_pagamento_ate": data_fim,
         }
         if args.get("status"):
             params_base["status"] = args["status"]
