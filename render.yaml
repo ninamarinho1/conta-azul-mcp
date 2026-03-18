@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: conta-azul-mcp
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: CONTA_AZUL_CLIENT_ID
+        sync: false
+      - key: CONTA_AZUL_CLIENT_SECRET
+        sync: false
+      - key: CONTA_AZUL_REDIRECT_URI
+        sync: false
+      - key: CONTA_AZUL_REFRESH_TOKEN
+        sync: false
