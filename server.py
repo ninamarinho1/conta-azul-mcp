@@ -156,13 +156,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
 async def _dispatch(name: str, args: dict) -> dict:
     if name == "buscar_lancamentos":
-        endpoint = "contas-a-pagar" if args.get("tipo", "DESPESA") == "DESPESA" else "contas-a-receber"
-        params = {
-            "pagina": 1,
-            "tamanho_pagina": 200,
-            "data_pagamento_de": args["data_inicio"],
-            "data_pagamento_ate": args["data_fim"],
-        }
+        tipo = args.get("tipo", "DESPESA")
+        endpoint = "contas-a-pagar" if tipo == "DESPESA" else "contas-a-receber"
+        if tipo == "DESPESA":
+            params = {"pagina": 1, "tamanho_pagina": 200, "data_pagamento_de": args["data_inicio"], "data_pagamento_ate": args["data_fim"]}
+        else:
+            params = {"pagina": 1, "tamanho_pagina": 200, "data_vencimento_de": args["data_inicio"], "data_vencimento_ate": args["data_fim"]}
         if args.get("status"):
             params["status"] = args["status"]
         return await _get(f"/financeiro/eventos-financeiros/{endpoint}/buscar", params)
