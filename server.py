@@ -47,7 +47,8 @@ async def _save_refresh_token_to_render(token: str):
             )
             existing = resp.json() if resp.status_code == 200 else []
             # 2. Atualiza só o refresh_token, mantém o resto
-            env_vars = [v for v in existing if v.get("key") != "CONTA_AZUL_REFRESH_TOKEN"]
+            # Strip campos extras como 'id' que o Render retorna mas não aceita no PUT
+            env_vars = [{"key": v["key"], "value": v["value"]} for v in existing if v.get("key") != "CONTA_AZUL_REFRESH_TOKEN"]
             env_vars.append({"key": "CONTA_AZUL_REFRESH_TOKEN", "value": token})
             # 3. Salva tudo de volta
             await client.put(
