@@ -1,5 +1,6 @@
 import os
 import json
+import calendar
 import httpx
 from datetime import datetime
 from mcp.server import Server
@@ -13,14 +14,11 @@ from starlette.requests import Request
 # ── Config ────────────────────────────────────────────────────────────────────
 CLIENT_ID     = os.environ["CONTA_AZUL_CLIENT_ID"]
 CLIENT_SECRET = os.environ["CONTA_AZUL_CLIENT_SECRET"]
-REDIRECT_URI  = os.environ["CONTA_AZUL_REDIRECT_URI"]   # ex: https://SEU_APP.up.railway.app/callback
+REDIRECT_URI  = os.environ["CONTA_AZUL_REDIRECT_URI"]
 BASE_URL      = "https://api-v2.contaazul.com/v1"
 AUTH_URL      = "https://auth.contaazul.com/oauth2"
 
 # ── Token management ─────────────────────────────────────────────────────────
-# O refresh_token é salvo em memória após o primeiro /callback.
-# Depois de obter, adicione CONTA_AZUL_REFRESH_TOKEN como env var no Railway
-# para sobreviver a reinicializações.
 _token_cache: dict = {}
 
 def _load_initial_tokens():
@@ -31,7 +29,7 @@ def _load_initial_tokens():
 
 _load_initial_tokens()
 
-RENDER_API_KEY  = os.environ.get("RENDER_API_KEY", "")
+RENDER_API_KEY    = os.environ.get("RENDER_API_KEY", "")
 RENDER_SERVICE_ID = "srv-d6tcskfafjfc73ffao2g"
 
 async def _save_refresh_token_to_render(token: str):
@@ -40,17 +38,13 @@ async def _save_refresh_token_to_render(token: str):
         return
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            # 1. Busca as variáveis existentes
             resp = await client.get(
                 f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/env-vars",
                 headers={"Authorization": f"Bearer {RENDER_API_KEY}"},
             )
             existing = resp.json() if resp.status_code == 200 else []
-            # 2. Atualiza só o refresh_token, mantém o resto
-            # Strip campos extras como 'id' que o Render retorna mas não aceita no PUT
             env_vars = [{"key": v["key"], "value": v["value"]} for v in existing if v.get("key") != "CONTA_AZUL_REFRESH_TOKEN"]
             env_vars.append({"key": "CONTA_AZUL_REFRESH_TOKEN", "value": token})
-            # 3. Salva tudo de volta
             await client.put(
                 f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/env-vars",
                 headers={"Authorization": f"Bearer {RENDER_API_KEY}", "Content-Type": "application/json"},
@@ -85,9 +79,7 @@ async def _get_access_token() -> str:
     _token_cache["refresh_token"] = new_rt
     _token_cache["expires_at"]    = datetime.now().timestamp() + tokens.get("expires_in", 3600) - 120
 
-    # Salva o novo refresh_token no Render automaticamente
     await _save_refresh_token_to_render(new_rt)
-
     return _token_cache["access_token"]
 
 async def _get(path: str, params: dict = None) -> dict:
@@ -101,6 +93,41 @@ async def _get(path: str, params: dict = None) -> dict:
         resp.raise_for_status()
         return resp.json()
 
+async def _get_all(path: str, params: dict) -> list:
+    """Itera todas as páginas de um endpoint paginado e retorna lista completa."""
+    items = []
+    pagina = 1
+    while True:
+        p = {**params, "pagina": pagina, "tamanho_pagina": 200}
+        data = await _get(path, p)
+        page_items = data.get("items") or data.get("content") or []
+        items.extend(page_items)
+        total = data.get("total", 0)
+        if len(items) >= total or not page_items:
+            break
+        pagina += 1
+    return items
+
+def _normalizar(items: list, tipo: str) -> list:
+    """Normaliza lista de eventos financeiros para formato flat por parcela."""
+    result = []
+    for item in items:
+        parcelas = item.get("parcelas") or [item]
+        for p in parcelas:
+            result.append({
+                "tipo":         tipo,
+                "fornecedor":   (item.get("pessoa") or {}).get("nome"),
+                "descricao":    p.get("descricao") or item.get("descricao"),
+                "categoria":    (p.get("categoria") or {}).get("nome"),
+                "centro_custo": (p.get("centro_de_custo") or {}).get("nome"),
+                "valor":        p.get("valor"),
+                "valor_pago":   p.get("valor_pago"),
+                "status":       p.get("status"),
+                "vencimento":   p.get("data_vencimento"),
+                "pagamento":    p.get("data_pagamento"),
+            })
+    return result
+
 # ── MCP Server ────────────────────────────────────────────────────────────────
 server = Server("conta-azul")
 
@@ -111,33 +138,74 @@ async def list_tools() -> list[Tool]:
             name="buscar_lancamentos",
             description=(
                 "Busca lançamentos financeiros (contas a pagar ou receber) por período. "
-                "Retorna fornecedor, valor, categoria, centro de custo e status."
+                "Usa data_vencimento por padrão — inclui Em aberto e Atrasado. "
+                "Retorna lista flat com fornecedor, valor, categoria, centro de custo e status."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "data_inicio": {"type": "string", "description": "Data inicial no formato YYYY-MM-DD"},
-                    "data_fim":    {"type": "string", "description": "Data final no formato YYYY-MM-DD"},
+                    "data_inicio": {"type": "string", "description": "Data inicial YYYY-MM-DD"},
+                    "data_fim":    {"type": "string", "description": "Data final YYYY-MM-DD"},
                     "tipo":        {"type": "string", "enum": ["DESPESA", "RECEITA"], "default": "DESPESA"},
                     "status":      {"type": "string", "enum": ["PENDENTE", "QUITADO", "ATRASADO", "CANCELADO"], "description": "Opcional — filtra por status"},
+                    "filtro_data": {"type": "string", "enum": ["vencimento", "pagamento"], "default": "vencimento", "description": "Qual data usar como filtro. Padrão: vencimento (inclui Em aberto). Use pagamento para pegar só os já quitados."},
                 },
                 "required": ["data_inicio", "data_fim"],
             },
         ),
         Tool(
-            name="buscar_lancamentos_por_categoria",
+            name="buscar_lancamentos_por_cc",
             description=(
-                "Busca lançamentos de despesas agrupados por categoria no período. "
-                "Útil para análise de CC e diff semanal."
+                "Busca despesas do período agrupadas por centro de custo. "
+                "Retorna por CC: total e lista de lançamentos com fornecedor, valor, status e vencimento. "
+                "Usa data_vencimento para incluir Em aberto e Atrasado. "
+                "Use para análise de despesas por área (COGS, S&M, R&D, G&A)."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "data_inicio": {"type": "string", "description": "YYYY-MM-DD"},
                     "data_fim":    {"type": "string", "description": "YYYY-MM-DD"},
-                    "status":      {"type": "string", "description": "Opcional: PENDENTE, QUITADO, ATRASADO"},
+                    "status":      {"type": "string", "description": "Opcional: QUITADO, PENDENTE, ATRASADO"},
                 },
                 "required": ["data_inicio", "data_fim"],
+            },
+        ),
+        Tool(
+            name="diff_semanal",
+            description=(
+                "Compara lançamentos de dois períodos por centro de custo. "
+                "Identifica: novos (➕), liquidados — passaram de Em aberto/Atrasado para Quitado/Conciliado (✅), "
+                "e alterados — valor mudou (✏️). "
+                "Retorna diff estruturado por CC pronto para análise narrativa do Processo ①. "
+                "Use data_inicio_atual = primeiro dia do mês para comparar acumulados."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "data_inicio_atual":    {"type": "string", "description": "Início do período atual YYYY-MM-DD"},
+                    "data_fim_atual":       {"type": "string", "description": "Fim do período atual YYYY-MM-DD (hoje)"},
+                    "data_inicio_anterior": {"type": "string", "description": "Início do período anterior YYYY-MM-DD (igual ao atual)"},
+                    "data_fim_anterior":    {"type": "string", "description": "Fim do período anterior YYYY-MM-DD (terça passada)"},
+                },
+                "required": ["data_inicio_atual", "data_fim_atual", "data_inicio_anterior", "data_fim_anterior"],
+            },
+        ),
+        Tool(
+            name="extrato_mensal",
+            description=(
+                "Retorna o extrato completo do mês — receitas e despesas — "
+                "com fornecedor/cliente, valor, categoria, centro de custo e status. "
+                "Inclui todos os status (Em aberto, Atrasado, Quitado). "
+                "Se não informar mês/ano, usa o mês atual."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "mes":    {"type": "integer", "description": "Mês (1-12). Padrão: mês atual."},
+                    "ano":    {"type": "integer", "description": "Ano (ex: 2026). Padrão: ano atual."},
+                    "status": {"type": "string", "description": "Opcional: PENDENTE, QUITADO, ATRASADO, CANCELADO"},
+                },
             },
         ),
         Tool(
@@ -160,23 +228,6 @@ async def list_tools() -> list[Tool]:
             description="Lista os centros de custo cadastrados.",
             inputSchema={"type": "object", "properties": {}},
         ),
-        Tool(
-            name="extrato_mensal",
-            description=(
-                "Retorna o extrato completo do mês — receitas e despesas — "
-                "com fornecedor/cliente, valor, categoria, centro de custo e status. "
-                "Equivalente ao XLS exportado do Conta Azul. "
-                "Se não informar mês/ano, usa o mês atual."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "mes":  {"type": "integer", "description": "Mês (1-12). Padrão: mês atual."},
-                    "ano":  {"type": "integer", "description": "Ano (ex: 2026). Padrão: ano atual."},
-                    "status": {"type": "string", "description": "Opcional: PENDENTE, QUITADO, ATRASADO, CANCELADO"},
-                },
-            },
-        ),
     ]
 
 @server.call_tool()
@@ -188,52 +239,136 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         return [TextContent(type="text", text=f"Erro: {e}")]
 
 async def _dispatch(name: str, args: dict) -> dict:
-    if name == "buscar_lancamentos":
-        tipo = args.get("tipo", "DESPESA")
-        endpoint = "contas-a-pagar" if tipo == "DESPESA" else "contas-a-receber"
-        if tipo == "DESPESA":
-            params = {"pagina": 1, "tamanho_pagina": 200, "data_pagamento_de": args["data_inicio"], "data_pagamento_ate": args["data_fim"]}
-        else:
-            params = {"pagina": 1, "tamanho_pagina": 200, "data_vencimento_de": args["data_inicio"], "data_vencimento_ate": args["data_fim"]}
-        if args.get("status"):
-            params["status"] = args["status"]
-        return await _get(f"/financeiro/eventos-financeiros/{endpoint}/buscar", params)
 
-    elif name == "buscar_lancamentos_por_categoria":
-        params = {
-            "pagina": 1,
-            "tamanho_pagina": 200,
-            "data_pagamento_de": args["data_inicio"],
-            "data_pagamento_ate": args["data_fim"],
+    # ── buscar_lancamentos ────────────────────────────────────────────────────
+    if name == "buscar_lancamentos":
+        tipo     = args.get("tipo", "DESPESA")
+        filtro   = args.get("filtro_data", "vencimento")
+        endpoint = "contas-a-pagar" if tipo == "DESPESA" else "contas-a-receber"
+        params   = {
+            f"data_{filtro}_de":  args["data_inicio"],
+            f"data_{filtro}_ate": args["data_fim"],
         }
         if args.get("status"):
             params["status"] = args["status"]
-        data = await _get("/financeiro/eventos-financeiros/contas-a-pagar/buscar", params)
+        items = await _get_all(f"/financeiro/eventos-financeiros/{endpoint}/buscar", params)
+        return _normalizar(items, tipo)
 
-        # Agrupa por categoria
-        por_categoria: dict[str, list] = {}
-        items = data.get("items") or data.get("content") or data if isinstance(data, list) else []
-        for item in items:
-            parcelas = item.get("parcelas") or [item]
-            for p in parcelas:
-                cat = (p.get("categoria") or {}).get("nome") or "Sem categoria"
-                por_categoria.setdefault(cat, []).append({
-                    "descricao":    p.get("descricao") or item.get("descricao"),
-                    "fornecedor":   (item.get("pessoa") or {}).get("nome"),
-                    "valor":        p.get("valor"),
-                    "valor_pago":   p.get("valor_pago"),
-                    "status":       p.get("status"),
-                    "vencimento":   p.get("data_vencimento"),
-                    "pagamento":    p.get("data_pagamento"),
+    # ── buscar_lancamentos_por_cc ─────────────────────────────────────────────
+    elif name == "buscar_lancamentos_por_cc":
+        params = {
+            "data_vencimento_de":  args["data_inicio"],
+            "data_vencimento_ate": args["data_fim"],
+        }
+        if args.get("status"):
+            params["status"] = args["status"]
+        items = await _get_all("/financeiro/eventos-financeiros/contas-a-pagar/buscar", params)
+        lancamentos = _normalizar(items, "DESPESA")
+
+        por_cc: dict[str, list] = {}
+        for l in lancamentos:
+            cc = l["centro_custo"] or "Sem CC"
+            por_cc.setdefault(cc, []).append(l)
+
+        return {
+            cc: {
+                "total": round(sum(l["valor"] or 0 for l in lista), 2),
+                "lancamentos": sorted(lista, key=lambda x: x["vencimento"] or ""),
+            }
+            for cc, lista in sorted(por_cc.items())
+        }
+
+    # ── diff_semanal ──────────────────────────────────────────────────────────
+    elif name == "diff_semanal":
+        endpoint = "/financeiro/eventos-financeiros/contas-a-pagar/buscar"
+        LIQUIDADOS = {"QUITADO", "CONCILIADO"}
+
+        items_atual = await _get_all(endpoint, {
+            "data_vencimento_de":  args["data_inicio_atual"],
+            "data_vencimento_ate": args["data_fim_atual"],
+        })
+        items_anterior = await _get_all(endpoint, {
+            "data_vencimento_de":  args["data_inicio_anterior"],
+            "data_vencimento_ate": args["data_fim_anterior"],
+        })
+
+        atual    = _normalizar(items_atual,    "DESPESA")
+        anterior = _normalizar(items_anterior, "DESPESA")
+
+        def _chave(l: dict) -> str:
+            return f"{l['fornecedor']}|{l['descricao']}|{l['vencimento']}"
+
+        map_anterior = {_chave(l): l for l in anterior}
+        map_atual    = {_chave(l): l for l in atual}
+
+        diff: dict[str, dict] = {}
+
+        for chave, l in map_atual.items():
+            cc = l["centro_custo"] or "Sem CC"
+            if cc not in diff:
+                diff[cc] = {"novos": [], "liquidados": [], "alterados": [], "sem_mudanca": []}
+
+            if chave not in map_anterior:
+                diff[cc]["novos"].append(l)                                         # ➕ Novo
+            elif l["status"] in LIQUIDADOS and map_anterior[chave]["status"] not in LIQUIDADOS:
+                diff[cc]["liquidados"].append(l)                                    # ✅ Liquidado
+            elif l["valor"] != map_anterior[chave]["valor"]:
+                diff[cc]["alterados"].append({                                      # ✏️ Alterado
+                    **l,
+                    "valor_anterior": map_anterior[chave]["valor"],
                 })
+            else:
+                diff[cc]["sem_mudanca"].append(l)
 
-        resumo = {cat: {"total": sum(i["valor"] or 0 for i in itens), "lancamentos": itens}
-                  for cat, itens in sorted(por_categoria.items())}
+        # Resumo por CC
+        resumo = {}
+        for cc, grupos in sorted(diff.items()):
+            tem_mudanca = grupos["novos"] or grupos["liquidados"] or grupos["alterados"]
+            resumo[cc] = {
+                "mudancas": tem_mudanca,
+                "novos":      grupos["novos"],
+                "liquidados": grupos["liquidados"],
+                "alterados":  grupos["alterados"],
+                "sem_mudanca_count": len(grupos["sem_mudanca"]),
+            }
         return resumo
 
+    # ── extrato_mensal ────────────────────────────────────────────────────────
+    elif name == "extrato_mensal":
+        hoje    = datetime.now()
+        mes     = args.get("mes") or hoje.month
+        ano     = args.get("ano") or hoje.year
+        ultimo_dia  = calendar.monthrange(ano, mes)[1]
+        data_inicio = f"{ano}-{mes:02d}-01"
+        data_fim    = f"{ano}-{mes:02d}-{ultimo_dia}"
+
+        params_base = {
+            "data_vencimento_de":  data_inicio,   # ← corrigido: era data_pagamento
+            "data_vencimento_ate": data_fim,
+        }
+        if args.get("status"):
+            params_base["status"] = args["status"]
+
+        despesas = _normalizar(await _get_all("/financeiro/eventos-financeiros/contas-a-pagar/buscar", params_base), "DESPESA")
+        receitas = _normalizar(await _get_all("/financeiro/eventos-financeiros/contas-a-receber/buscar", params_base), "RECEITA")
+
+        return {
+            "periodo": f"{mes:02d}/{ano}",
+            "resumo": {
+                "total_receitas":  round(sum(i["valor"] or 0 for i in receitas), 2),
+                "total_despesas":  round(sum(i["valor"] or 0 for i in despesas), 2),
+                "saldo":           round(sum(i["valor"] or 0 for i in receitas) - sum(i["valor"] or 0 for i in despesas), 2),
+                "qtd_receitas":    len(receitas),
+                "qtd_despesas":    len(despesas),
+            },
+            "despesas": despesas,
+            "receitas": receitas,
+        }
+
+    # ── saldo_contas ──────────────────────────────────────────────────────────
     elif name == "saldo_contas":
         contas = await _get("/conta-financeira", {"pagina": 1, "tamanho_pagina": 20, "apenas_ativo": "true"})
-        items = contas.get("items") or contas.get("content") or contas if isinstance(contas, list) else []
+        items  = contas.get("items") or contas.get("content") or []
         resultado = []
         for c in items:
             cid = c.get("id")
@@ -248,76 +383,16 @@ async def _dispatch(name: str, args: dict) -> dict:
             })
         return resultado
 
+    # ── listar_categorias ─────────────────────────────────────────────────────
     elif name == "listar_categorias":
         params: dict = {"pagina": 1, "tamanho_pagina": 100}
         if args.get("tipo"):
             params["tipo"] = args["tipo"]
         return await _get("/categorias", params)
 
+    # ── listar_centros_de_custo ───────────────────────────────────────────────
     elif name == "listar_centros_de_custo":
         return await _get("/centro-de-custo", {"pagina": 1, "tamanho_pagina": 100, "filtro_rapido": "ATIVO"})
-
-    elif name == "extrato_mensal":
-        hoje = datetime.now()
-        mes = args.get("mes") or hoje.month
-        ano = args.get("ano") or hoje.year
-        import calendar
-        ultimo_dia = calendar.monthrange(ano, mes)[1]
-        data_inicio = f"{ano}-{mes:02d}-01"
-        data_fim    = f"{ano}-{mes:02d}-{ultimo_dia}"
-
-        params_base = {
-            "pagina": 1,
-            "tamanho_pagina": 500,
-            "data_pagamento_de": data_inicio,
-            "data_pagamento_ate": data_fim,
-        }
-        if args.get("status"):
-            params_base["status"] = args["status"]
-
-        def _parse_items(data):
-            return data.get("items") or data.get("content") or (data if isinstance(data, list) else [])
-
-        def _normalizar(items, tipo):
-            result = []
-            for item in items:
-                parcelas = item.get("parcelas") or [item]
-                for p in parcelas:
-                    result.append({
-                        "tipo":          tipo,
-                        "fornecedor_cliente": (item.get("pessoa") or {}).get("nome"),
-                        "descricao":     p.get("descricao") or item.get("descricao"),
-                        "categoria":     (p.get("categoria") or {}).get("nome"),
-                        "centro_custo":  (p.get("centro_de_custo") or {}).get("nome"),
-                        "valor":         p.get("valor"),
-                        "valor_pago":    p.get("valor_pago"),
-                        "status":        p.get("status"),
-                        "vencimento":    p.get("data_vencimento"),
-                        "pagamento":     p.get("data_pagamento"),
-                    })
-            return result
-
-        despesas_raw = await _get("/financeiro/eventos-financeiros/contas-a-pagar/buscar", params_base)
-        receitas_raw = await _get("/financeiro/eventos-financeiros/contas-a-receber/buscar", params_base)
-
-        despesas = _normalizar(_parse_items(despesas_raw), "DESPESA")
-        receitas = _normalizar(_parse_items(receitas_raw), "RECEITA")
-
-        total_despesas = sum(i["valor"] or 0 for i in despesas)
-        total_receitas = sum(i["valor"] or 0 for i in receitas)
-
-        return {
-            "periodo": f"{mes:02d}/{ano}",
-            "resumo": {
-                "total_receitas": total_receitas,
-                "total_despesas": total_despesas,
-                "saldo": total_receitas - total_despesas,
-                "qtd_receitas": len(receitas),
-                "qtd_despesas": len(despesas),
-            },
-            "despesas": despesas,
-            "receitas": receitas,
-        }
 
     else:
         raise ValueError(f"Tool desconhecida: {name}")
