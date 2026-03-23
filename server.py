@@ -107,11 +107,12 @@ def _extrair_items(data: object) -> tuple[list, int, object]:
         return data, len(data), None
 
     if isinstance(data, dict):
-        for chave in ("items", "content", "data", "lancamentos", "eventos", "registros"):
+        for chave in ("itens", "items", "content", "data", "lancamentos", "eventos", "registros"):
             if data.get(chave) is not None:
                 items = data[chave] if isinstance(data[chave], list) else []
                 total = (
-                    data.get("total")
+                    data.get("itens_totais")  # Conta Azul API v2
+                    or data.get("total")
                     or data.get("totalElements")
                     or data.get("total_registros")
                     or len(items)
@@ -149,25 +150,54 @@ async def _get_all(path: str, params: dict) -> tuple[list, object]:
 
     return items, debug_raw
 
+_STATUS_MAP = {
+    "ACQUITTED": "QUITADO",
+    "PENDING":   "PENDENTE",
+    "OVERDUE":   "ATRASADO",
+    "CANCELLED": "CANCELADO",
+    "QUITADO":    "QUITADO",
+    "CONCILIADO": "CONCILIADO",
+    "PENDENTE":   "PENDENTE",
+    "ATRASADO":   "ATRASADO",
+    "CANCELADO":  "CANCELADO",
+}
+
 def _normalizar(items: list, tipo: str) -> list:
-    """Normaliza lista de eventos financeiros para formato flat por parcela."""
+    """
+    Normaliza itens da API Conta Azul v2 para formato flat.
+    API v2: total/pago, categorias[], centros_de_custo[], fornecedor/cliente, status em ingles.
+    """
     result = []
     for item in items:
         parcelas = item.get("parcelas") or [item]
         for p in parcelas:
+            pessoa = (
+                p.get("fornecedor") or p.get("cliente")
+                or item.get("fornecedor") or item.get("cliente")
+                or item.get("pessoa") or {}
+            )
+            valor      = p.get("total") if p.get("total") is not None else p.get("valor")
+            valor_pago = p.get("pago")  if p.get("pago")  is not None else p.get("valor_pago")
+            cats = p.get("categorias") or ([p["categoria"]] if p.get("categoria") else [])
+            categoria = cats[0].get("nome") if cats else None
+            ccs = p.get("centros_de_custo") or ([p["centro_de_custo"]] if p.get("centro_de_custo") else [])
+            centro_custo = ccs[0].get("nome") if ccs else None
+            status_raw = p.get("status") or item.get("status")
+            status = _STATUS_MAP.get(status_raw, status_raw)
             result.append({
                 "tipo":         tipo,
-                "fornecedor":   (item.get("pessoa") or {}).get("nome"),
+                "fornecedor":   pessoa.get("nome") if isinstance(pessoa, dict) else None,
                 "descricao":    p.get("descricao") or item.get("descricao"),
-                "categoria":    (p.get("categoria") or {}).get("nome"),
-                "centro_custo": (p.get("centro_de_custo") or {}).get("nome"),
-                "valor":        p.get("valor"),
-                "valor_pago":   p.get("valor_pago"),
-                "status":       p.get("status"),
+                "categoria":    categoria,
+                "centro_custo": centro_custo,
+                "valor":        valor,
+                "valor_pago":   valor_pago,
+                "status":       status,
                 "vencimento":   p.get("data_vencimento"),
                 "pagamento":    p.get("data_pagamento"),
             })
     return result
+
 
 # ── MCP Server ────────────────────────────────────────────────────────────────
 server = Server("conta-azul")
