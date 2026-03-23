@@ -93,20 +93,61 @@ async def _get(path: str, params: dict = None) -> dict:
         resp.raise_for_status()
         return resp.json()
 
-async def _get_all(path: str, params: dict) -> list:
-    """Itera todas as páginas de um endpoint paginado e retorna lista completa."""
+def _extrair_items(data: object) -> tuple[list, int, object]:
+    """
+    Extrai a lista de itens de uma resposta da API, independente do formato.
+    Retorna (items, total, raw_data_para_debug).
+
+    Tenta, em ordem:
+      1. dict com chave "items", "content", "data" ou "lancamentos"
+      2. lista diretamente (API retornou array)
+      3. lista vazia + raw para debug
+    """
+    if isinstance(data, list):
+        return data, len(data), None
+
+    if isinstance(data, dict):
+        for chave in ("items", "content", "data", "lancamentos", "eventos", "registros"):
+            if data.get(chave) is not None:
+                items = data[chave] if isinstance(data[chave], list) else []
+                total = (
+                    data.get("total")
+                    or data.get("totalElements")
+                    or data.get("total_registros")
+                    or len(items)
+                )
+                return items, int(total), None
+
+    # Nenhum formato reconhecido — devolve raw para debug
+    return [], 0, data
+
+async def _get_all(path: str, params: dict) -> tuple[list, object]:
+    """
+    Itera todas as páginas de um endpoint paginado e retorna (lista_completa, debug_info).
+    debug_info é None quando tudo correu bem; caso contrário, contém a resposta bruta
+    da primeira página para diagnóstico.
+    """
     items = []
     pagina = 1
+    debug_raw = None
+
     while True:
         p = {**params, "pagina": pagina, "tamanho_pagina": 200}
         data = await _get(path, p)
-        page_items = data.get("items") or data.get("content") or []
+        page_items, total, raw = _extrair_items(data)
+
+        if pagina == 1 and raw is not None:
+            # Formato não reconhecido — salva raw e para
+            debug_raw = raw
+            break
+
         items.extend(page_items)
-        total = data.get("total", 0)
+
         if len(items) >= total or not page_items:
             break
         pagina += 1
-    return items
+
+    return items, debug_raw
 
 def _normalizar(items: list, tipo: str) -> list:
     """Normaliza lista de eventos financeiros para formato flat por parcela."""
@@ -251,8 +292,11 @@ async def _dispatch(name: str, args: dict) -> dict:
         }
         if args.get("status"):
             params["status"] = args["status"]
-        items = await _get_all(f"/financeiro/eventos-financeiros/{endpoint}/buscar", params)
-        return _normalizar(items, tipo)
+        items, debug = await _get_all(f"/financeiro/eventos-financeiros/{endpoint}/buscar", params)
+        result = _normalizar(items, tipo)
+        if debug is not None:
+            return {"_erro_formato_api": debug, "lancamentos": result}
+        return result
 
     # ── buscar_lancamentos_por_cc ─────────────────────────────────────────────
     elif name == "buscar_lancamentos_por_cc":
@@ -262,7 +306,9 @@ async def _dispatch(name: str, args: dict) -> dict:
         }
         if args.get("status"):
             params["status"] = args["status"]
-        items = await _get_all("/financeiro/eventos-financeiros/contas-a-pagar/buscar", params)
+        items, debug = await _get_all("/financeiro/eventos-financeiros/contas-a-pagar/buscar", params)
+        if debug is not None:
+            return {"_erro_formato_api": debug}
         lancamentos = _normalizar(items, "DESPESA")
 
         por_cc: dict[str, list] = {}
@@ -283,14 +329,17 @@ async def _dispatch(name: str, args: dict) -> dict:
         endpoint = "/financeiro/eventos-financeiros/contas-a-pagar/buscar"
         LIQUIDADOS = {"QUITADO", "CONCILIADO"}
 
-        items_atual = await _get_all(endpoint, {
+        items_atual, debug1 = await _get_all(endpoint, {
             "data_vencimento_de":  args["data_inicio_atual"],
             "data_vencimento_ate": args["data_fim_atual"],
         })
-        items_anterior = await _get_all(endpoint, {
+        items_anterior, debug2 = await _get_all(endpoint, {
             "data_vencimento_de":  args["data_inicio_anterior"],
             "data_vencimento_ate": args["data_fim_anterior"],
         })
+
+        if debug1 or debug2:
+            return {"_erro_formato_api": {"atual": debug1, "anterior": debug2}}
 
         atual    = _normalizar(items_atual,    "DESPESA")
         anterior = _normalizar(items_anterior, "DESPESA")
@@ -320,7 +369,6 @@ async def _dispatch(name: str, args: dict) -> dict:
             else:
                 diff[cc]["sem_mudanca"].append(l)
 
-        # Resumo por CC
         resumo = {}
         for cc, grupos in sorted(diff.items()):
             tem_mudanca = grupos["novos"] or grupos["liquidados"] or grupos["alterados"]
@@ -335,31 +383,50 @@ async def _dispatch(name: str, args: dict) -> dict:
 
     # ── extrato_mensal ────────────────────────────────────────────────────────
     elif name == "extrato_mensal":
-        hoje    = datetime.now()
-        mes     = args.get("mes") or hoje.month
-        ano     = args.get("ano") or hoje.year
+        hoje        = datetime.now()
+        mes         = args.get("mes") or hoje.month
+        ano         = args.get("ano") or hoje.year
         ultimo_dia  = calendar.monthrange(ano, mes)[1]
         data_inicio = f"{ano}-{mes:02d}-01"
         data_fim    = f"{ano}-{mes:02d}-{ultimo_dia}"
 
         params_base = {
-            "data_vencimento_de":  data_inicio,   # ← corrigido: era data_pagamento
+            "data_vencimento_de":  data_inicio,
             "data_vencimento_ate": data_fim,
         }
         if args.get("status"):
             params_base["status"] = args["status"]
 
-        despesas = _normalizar(await _get_all("/financeiro/eventos-financeiros/contas-a-pagar/buscar", params_base), "DESPESA")
-        receitas = _normalizar(await _get_all("/financeiro/eventos-financeiros/contas-a-receber/buscar", params_base), "RECEITA")
+        items_d, debug_d = await _get_all("/financeiro/eventos-financeiros/contas-a-pagar/buscar",  params_base)
+        items_r, debug_r = await _get_all("/financeiro/eventos-financeiros/contas-a-receber/buscar", params_base)
+
+        # Se a API devolveu formato não reconhecido, expõe o raw para diagnóstico
+        if debug_d is not None or debug_r is not None:
+            return {
+                "periodo": f"{mes:02d}/{ano}",
+                "_erro_formato_api": {
+                    "despesas_raw": debug_d,
+                    "receitas_raw": debug_r,
+                },
+                "resumo": {"total_receitas": 0, "total_despesas": 0, "saldo": 0, "qtd_receitas": 0, "qtd_despesas": 0},
+                "despesas": [],
+                "receitas": [],
+            }
+
+        despesas = _normalizar(items_d, "DESPESA")
+        receitas = _normalizar(items_r, "RECEITA")
+
+        total_receitas = round(sum(i["valor"] or 0 for i in receitas), 2)
+        total_despesas = round(sum(i["valor"] or 0 for i in despesas), 2)
 
         return {
             "periodo": f"{mes:02d}/{ano}",
             "resumo": {
-                "total_receitas":  round(sum(i["valor"] or 0 for i in receitas), 2),
-                "total_despesas":  round(sum(i["valor"] or 0 for i in despesas), 2),
-                "saldo":           round(sum(i["valor"] or 0 for i in receitas) - sum(i["valor"] or 0 for i in despesas), 2),
-                "qtd_receitas":    len(receitas),
-                "qtd_despesas":    len(despesas),
+                "total_receitas": total_receitas,
+                "total_despesas": total_despesas,
+                "saldo":          round(total_receitas - total_despesas, 2),
+                "qtd_receitas":   len(receitas),
+                "qtd_despesas":   len(despesas),
             },
             "despesas": despesas,
             "receitas": receitas,
@@ -368,7 +435,7 @@ async def _dispatch(name: str, args: dict) -> dict:
     # ── saldo_contas ──────────────────────────────────────────────────────────
     elif name == "saldo_contas":
         contas = await _get("/conta-financeira", {"pagina": 1, "tamanho_pagina": 20, "apenas_ativo": "true"})
-        items  = contas.get("items") or contas.get("content") or []
+        items, _ = _extrair_items(contas)
         resultado = []
         for c in items:
             cid = c.get("id")
