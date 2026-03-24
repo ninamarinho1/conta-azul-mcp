@@ -547,7 +547,7 @@ async def health(request: Request):
 sse = SseServerTransport("/messages")
 
 async def handle_sse(request: Request):
-    async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
+async with sse.connect_sse(request.scope, request.receive, request.scope["send"]) as streams:
         await server.run(streams[0], streams[1], server.create_initialization_options())
 
 app = Starlette(routes=[
