@@ -94,60 +94,37 @@ async def _get(path: str, params: dict = None) -> dict:
         return resp.json()
 
 def _extrair_items(data: object) -> tuple[list, int, object]:
-    """
-    Extrai a lista de itens de uma resposta da API, independente do formato.
-    Retorna (items, total, raw_data_para_debug).
-
-    Tenta, em ordem:
-      1. dict com chave "items", "content", "data" ou "lancamentos"
-      2. lista diretamente (API retornou array)
-      3. lista vazia + raw para debug
-    """
     if isinstance(data, list):
         return data, len(data), None
-
     if isinstance(data, dict):
         for chave in ("itens", "items", "content", "data", "lancamentos", "eventos", "registros"):
             if data.get(chave) is not None:
                 items = data[chave] if isinstance(data[chave], list) else []
                 total = (
-                    data.get("itens_totais")  # Conta Azul API v2
+                    data.get("itens_totais")
                     or data.get("total")
                     or data.get("totalElements")
                     or data.get("total_registros")
                     or len(items)
                 )
                 return items, int(total), None
-
-    # Nenhum formato reconhecido — devolve raw para debug
     return [], 0, data
 
 async def _get_all(path: str, params: dict) -> tuple[list, object]:
-    """
-    Itera todas as páginas de um endpoint paginado e retorna (lista_completa, debug_info).
-    debug_info é None quando tudo correu bem; caso contrário, contém a resposta bruta
-    da primeira página para diagnóstico.
-    """
     items = []
     pagina = 1
     debug_raw = None
-
     while True:
         p = {**params, "pagina": pagina, "tamanho_pagina": 200}
         data = await _get(path, p)
         page_items, total, raw = _extrair_items(data)
-
         if pagina == 1 and raw is not None:
-            # Formato não reconhecido — salva raw e para
             debug_raw = raw
             break
-
         items.extend(page_items)
-
         if len(items) >= total or not page_items:
             break
         pagina += 1
-
     return items, debug_raw
 
 _STATUS_MAP = {
@@ -163,10 +140,6 @@ _STATUS_MAP = {
 }
 
 def _normalizar(items: list, tipo: str) -> list:
-    """
-    Normaliza itens da API Conta Azul v2 para formato flat.
-    API v2: total/pago, categorias[], centros_de_custo[], fornecedor/cliente, status em ingles.
-    """
     result = []
     for item in items:
         parcelas = item.get("parcelas") or [item]
@@ -219,7 +192,7 @@ async def list_tools() -> list[Tool]:
                     "data_fim":    {"type": "string", "description": "Data final YYYY-MM-DD"},
                     "tipo":        {"type": "string", "enum": ["DESPESA", "RECEITA"], "default": "DESPESA"},
                     "status":      {"type": "string", "enum": ["PENDENTE", "QUITADO", "ATRASADO", "CANCELADO"], "description": "Opcional — filtra por status"},
-                    "filtro_data": {"type": "string", "enum": ["vencimento", "pagamento"], "default": "vencimento", "description": "Qual data usar como filtro. Padrão: vencimento (inclui Em aberto). Use pagamento para pegar só os já quitados."},
+                    "filtro_data": {"type": "string", "enum": ["vencimento", "pagamento"], "default": "vencimento", "description": "Qual data usar como filtro."},
                 },
                 "required": ["data_inicio", "data_fim"],
             },
@@ -229,8 +202,7 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Busca despesas do período agrupadas por centro de custo. "
                 "Retorna por CC: total e lista de lançamentos com fornecedor, valor, status e vencimento. "
-                "Usa data_vencimento para incluir Em aberto e Atrasado. "
-                "Use para análise de despesas por área (COGS, S&M, R&D, G&A)."
+                "Usa data_vencimento para incluir Em aberto e Atrasado."
             ),
             inputSchema={
                 "type": "object",
@@ -246,18 +218,16 @@ async def list_tools() -> list[Tool]:
             name="diff_semanal",
             description=(
                 "Compara lançamentos de dois períodos por centro de custo. "
-                "Identifica: novos (➕), liquidados — passaram de Em aberto/Atrasado para Quitado/Conciliado (✅), "
-                "e alterados — valor mudou (✏️). "
-                "Retorna diff estruturado por CC pronto para análise narrativa do Processo ①. "
-                "Use data_inicio_atual = primeiro dia do mês para comparar acumulados."
+                "Identifica: novos (➕), liquidados (✅), alterados (✏️). "
+                "Retorna diff estruturado por CC pronto para análise narrativa do Processo ①."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "data_inicio_atual":    {"type": "string", "description": "Início do período atual YYYY-MM-DD"},
-                    "data_fim_atual":       {"type": "string", "description": "Fim do período atual YYYY-MM-DD (hoje)"},
-                    "data_inicio_anterior": {"type": "string", "description": "Início do período anterior YYYY-MM-DD (igual ao atual)"},
-                    "data_fim_anterior":    {"type": "string", "description": "Fim do período anterior YYYY-MM-DD (terça passada)"},
+                    "data_fim_atual":       {"type": "string", "description": "Fim do período atual YYYY-MM-DD"},
+                    "data_inicio_anterior": {"type": "string", "description": "Início do período anterior YYYY-MM-DD"},
+                    "data_fim_anterior":    {"type": "string", "description": "Fim do período anterior YYYY-MM-DD"},
                 },
                 "required": ["data_inicio_atual", "data_fim_atual", "data_inicio_anterior", "data_fim_anterior"],
             },
@@ -265,10 +235,8 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="extrato_mensal",
             description=(
-                "Retorna o extrato completo do mês — receitas e despesas — "
-                "com fornecedor/cliente, valor, categoria, centro de custo e status. "
-                "Inclui todos os status (Em aberto, Atrasado, Quitado). "
-                "Se não informar mês/ano, usa o mês atual."
+                "Retorna o extrato completo do mês — receitas e despesas. "
+                "Inclui todos os status. Se não informar mês/ano, usa o mês atual."
             ),
             inputSchema={
                 "type": "object",
@@ -311,7 +279,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
 async def _dispatch(name: str, args: dict) -> dict:
 
-    # ── buscar_lancamentos ────────────────────────────────────────────────────
     if name == "buscar_lancamentos":
         tipo     = args.get("tipo", "DESPESA")
         filtro   = args.get("filtro_data", "vencimento")
@@ -328,7 +295,6 @@ async def _dispatch(name: str, args: dict) -> dict:
             return {"_erro_formato_api": debug, "lancamentos": result}
         return result
 
-    # ── buscar_lancamentos_por_cc ─────────────────────────────────────────────
     elif name == "buscar_lancamentos_por_cc":
         params = {
             "data_vencimento_de":  args["data_inicio"],
@@ -340,12 +306,10 @@ async def _dispatch(name: str, args: dict) -> dict:
         if debug is not None:
             return {"_erro_formato_api": debug}
         lancamentos = _normalizar(items, "DESPESA")
-
         por_cc: dict[str, list] = {}
         for l in lancamentos:
             cc = l["centro_custo"] or "Sem CC"
             por_cc.setdefault(cc, []).append(l)
-
         return {
             cc: {
                 "total": round(sum(l["valor"] or 0 for l in lista), 2),
@@ -354,11 +318,9 @@ async def _dispatch(name: str, args: dict) -> dict:
             for cc, lista in sorted(por_cc.items())
         }
 
-    # ── diff_semanal ──────────────────────────────────────────────────────────
     elif name == "diff_semanal":
         endpoint = "/financeiro/eventos-financeiros/contas-a-pagar/buscar"
         LIQUIDADOS = {"QUITADO", "CONCILIADO"}
-
         items_atual, debug1 = await _get_all(endpoint, {
             "data_vencimento_de":  args["data_inicio_atual"],
             "data_vencimento_ate": args["data_fim_atual"],
@@ -367,38 +329,27 @@ async def _dispatch(name: str, args: dict) -> dict:
             "data_vencimento_de":  args["data_inicio_anterior"],
             "data_vencimento_ate": args["data_fim_anterior"],
         })
-
         if debug1 or debug2:
             return {"_erro_formato_api": {"atual": debug1, "anterior": debug2}}
-
         atual    = _normalizar(items_atual,    "DESPESA")
         anterior = _normalizar(items_anterior, "DESPESA")
-
         def _chave(l: dict) -> str:
             return f"{l['fornecedor']}|{l['descricao']}|{l['vencimento']}"
-
         map_anterior = {_chave(l): l for l in anterior}
         map_atual    = {_chave(l): l for l in atual}
-
         diff: dict[str, dict] = {}
-
         for chave, l in map_atual.items():
             cc = l["centro_custo"] or "Sem CC"
             if cc not in diff:
                 diff[cc] = {"novos": [], "liquidados": [], "alterados": [], "sem_mudanca": []}
-
             if chave not in map_anterior:
-                diff[cc]["novos"].append(l)                                         # ➕ Novo
+                diff[cc]["novos"].append(l)
             elif l["status"] in LIQUIDADOS and map_anterior[chave]["status"] not in LIQUIDADOS:
-                diff[cc]["liquidados"].append(l)                                    # ✅ Liquidado
+                diff[cc]["liquidados"].append(l)
             elif l["valor"] != map_anterior[chave]["valor"]:
-                diff[cc]["alterados"].append({                                      # ✏️ Alterado
-                    **l,
-                    "valor_anterior": map_anterior[chave]["valor"],
-                })
+                diff[cc]["alterados"].append({**l, "valor_anterior": map_anterior[chave]["valor"]})
             else:
                 diff[cc]["sem_mudanca"].append(l)
-
         resumo = {}
         for cc, grupos in sorted(diff.items()):
             tem_mudanca = grupos["novos"] or grupos["liquidados"] or grupos["alterados"]
@@ -411,7 +362,6 @@ async def _dispatch(name: str, args: dict) -> dict:
             }
         return resumo
 
-    # ── extrato_mensal ────────────────────────────────────────────────────────
     elif name == "extrato_mensal":
         hoje        = datetime.now()
         mes         = args.get("mes") or hoje.month
@@ -419,42 +369,21 @@ async def _dispatch(name: str, args: dict) -> dict:
         ultimo_dia  = calendar.monthrange(ano, mes)[1]
         data_inicio = f"{ano}-{mes:02d}-01"
         data_fim    = f"{ano}-{mes:02d}-{ultimo_dia}"
-
-        params_base = {
-            "data_vencimento_de":  data_inicio,
-            "data_vencimento_ate": data_fim,
-        }
+        params_base = {"data_vencimento_de": data_inicio, "data_vencimento_ate": data_fim}
         if args.get("status"):
             params_base["status"] = args["status"]
-
         items_d, debug_d = await _get_all("/financeiro/eventos-financeiros/contas-a-pagar/buscar",  params_base)
         items_r, debug_r = await _get_all("/financeiro/eventos-financeiros/contas-a-receber/buscar", params_base)
-
-        # Se a API devolveu formato não reconhecido, expõe o raw para diagnóstico
         if debug_d is not None or debug_r is not None:
-            return {
-                "periodo": f"{mes:02d}/{ano}",
-                "_erro_formato_api": {
-                    "despesas_raw": debug_d,
-                    "receitas_raw": debug_r,
-                },
-                "resumo": {"total_receitas": 0, "total_despesas": 0, "saldo": 0, "qtd_receitas": 0, "qtd_despesas": 0},
-                "despesas": [],
-                "receitas": [],
-            }
-
+            return {"periodo": f"{mes:02d}/{ano}", "_erro_formato_api": {"despesas_raw": debug_d, "receitas_raw": debug_r}, "resumo": {}, "despesas": [], "receitas": []}
         despesas = _normalizar(items_d, "DESPESA")
         receitas = _normalizar(items_r, "RECEITA")
-
-        total_receitas = round(sum(i["valor"] or 0 for i in receitas), 2)
-        total_despesas = round(sum(i["valor"] or 0 for i in despesas), 2)
-
         return {
             "periodo": f"{mes:02d}/{ano}",
             "resumo": {
-                "total_receitas": total_receitas,
-                "total_despesas": total_despesas,
-                "saldo":          round(total_receitas - total_despesas, 2),
+                "total_receitas": round(sum(i["valor"] or 0 for i in receitas), 2),
+                "total_despesas": round(sum(i["valor"] or 0 for i in despesas), 2),
+                "saldo":          round(sum(i["valor"] or 0 for i in receitas) - sum(i["valor"] or 0 for i in despesas), 2),
                 "qtd_receitas":   len(receitas),
                 "qtd_despesas":   len(despesas),
             },
@@ -462,7 +391,6 @@ async def _dispatch(name: str, args: dict) -> dict:
             "receitas": receitas,
         }
 
-    # ── saldo_contas ──────────────────────────────────────────────────────────
     elif name == "saldo_contas":
         contas = await _get("/conta-financeira", {"pagina": 1, "tamanho_pagina": 20, "apenas_ativo": "true"})
         items, _ = _extrair_items(contas)
@@ -473,26 +401,21 @@ async def _dispatch(name: str, args: dict) -> dict:
                 saldo = await _get(f"/conta-financeira/{cid}/saldo-atual")
             except Exception:
                 saldo = {}
-            resultado.append({
-                "nome":  c.get("nome"),
-                "tipo":  c.get("tipo"),
-                "saldo": saldo.get("saldo_atual"),
-            })
+            resultado.append({"nome": c.get("nome"), "tipo": c.get("tipo"), "saldo": saldo.get("saldo_atual")})
         return resultado
 
-    # ── listar_categorias ─────────────────────────────────────────────────────
     elif name == "listar_categorias":
         params: dict = {"pagina": 1, "tamanho_pagina": 100}
         if args.get("tipo"):
             params["tipo"] = args["tipo"]
         return await _get("/categorias", params)
 
-    # ── listar_centros_de_custo ───────────────────────────────────────────────
     elif name == "listar_centros_de_custo":
         return await _get("/centro-de-custo", {"pagina": 1, "tamanho_pagina": 100, "filtro_rapido": "ATIVO"})
 
     else:
         raise ValueError(f"Tool desconhecida: {name}")
+
 
 # ── OAuth routes ──────────────────────────────────────────────────────────────
 async def auth_redirect(request: Request):
@@ -510,7 +433,6 @@ async def oauth_callback(request: Request):
     code = request.query_params.get("code")
     if not code:
         return HTMLResponse("<h1>❌ Erro</h1><p>Código de autorização não recebido.</p>")
-
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             f"{AUTH_URL}/token",
@@ -524,17 +446,13 @@ async def oauth_callback(request: Request):
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         tokens = resp.json()
-
     if "refresh_token" not in tokens:
         return HTMLResponse(f"<h1>❌ Erro na troca de token</h1><pre>{json.dumps(tokens, indent=2)}</pre>")
-
     rt = tokens["refresh_token"]
     _token_cache["access_token"]  = tokens["access_token"]
     _token_cache["refresh_token"] = rt
     _token_cache["expires_at"]    = datetime.now().timestamp() + tokens.get("expires_in", 3600) - 120
-
     await _save_refresh_token_to_render(rt)
-
     return HTMLResponse("""
     <h1>✅ Autorizado com sucesso!</h1>
     <p>Token salvo automaticamente. Pode fechar essa janela — o MCP está pronto.</p>
@@ -543,11 +461,13 @@ async def oauth_callback(request: Request):
 async def health(request: Request):
     return HTMLResponse("ok")
 
+
 # ── ASGI app ──────────────────────────────────────────────────────────────────
 sse = SseServerTransport("/messages")
 
 async def handle_sse(request: Request):
-async with sse.connect_sse(request.scope, request.receive, request.scope["send"]) as streams:
+    # FIX: usar request.scope["send"] em vez de request._send (atributo privado quebrado no Starlette atual)
+    async with sse.connect_sse(request.scope, request.receive, request.scope["send"]) as streams:
         await server.run(streams[0], streams[1], server.create_initialization_options())
 
 app = Starlette(routes=[
